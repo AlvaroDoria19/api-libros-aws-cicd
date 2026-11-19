@@ -51,7 +51,7 @@ describe('API Catálogo de Libros (sin RDS real)', () => {
     ]);
     app = createApp({
       librosRepository: fakeRepo,
-      version: '1.0.0',
+      version: '1.1.0',
       commit: 'test-sha',
     });
   });
@@ -64,7 +64,8 @@ describe('API Catálogo de Libros (sin RDS real)', () => {
       expect.objectContaining({
         status: 'ok',
         service: 'api-libros',
-        version: '1.0.0',
+        version: '1.1.0',
+        despliegue: 'cd-docker-v1.1.0',
         commit: 'test-sha',
       })
     );

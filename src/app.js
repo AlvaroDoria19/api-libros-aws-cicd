@@ -23,6 +23,7 @@ function createApp({ librosRepository, version = '1.0.0', commit = 'local' }) {
       status: 'ok',
       service: 'api-libros',
       version,
+      despliegue: 'cd-docker-v1.1.0',
       commit,
       timestamp: new Date().toISOString(),
     });
