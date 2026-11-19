@@ -1,0 +1,200 @@
+name: CD - Build, Push ECR y Despliegue en EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Ejecutar pruebas antes de empaquetar
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Instalar dependencias limpias
+        run: npm ci
+
+      - name: Ejecutar suite de pruebas
+        run: npm test
+
+  build-and-push:
+    name: Construir imagen Docker y publicar en Amazon ECR
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Iniciar sesión en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir y publicar imagen etiquetada con commit SHA
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build --build-arg APP_COMMIT_SHA="${IMAGE_TAG}" -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
+          echo "image=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Desplegar en EC2 con verificación y rollback
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Autorizar IP temporal del runner en el SG de EC2
+        id: sg
+        env:
+          EC2_SG_ID: ${{ secrets.EC2_SG_ID }}
+        run: |
+          RUNNER_IP=$(curl -4 -s --max-time 10 https://checkip.amazonaws.com)
+          echo "runner_ip=${RUNNER_IP}" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$EC2_SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32"
+          sleep 3
+
+      - name: Desplegar contenedor en EC2 y verificar salud
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          NEW_IMAGE: ${{ needs.build-and-push.outputs.image }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          KEY_FILE=$(mktemp)
+          chmod 600 "$KEY_FILE"
+          printf '%s\n' "$EC2_SSH_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          ECR_PASS=$(aws ecr get-login-password --region "$AWS_REGION")
+          printf '%s' "$ECR_PASS" | ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "${EC2_USER}@${EC2_HOST}" \
+            "cat > /tmp/.ecr_pass && chmod 600 /tmp/.ecr_pass"
+
+          ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "${EC2_USER}@${EC2_HOST}" \
+            "REGISTRY='${REGISTRY}' NEW_IMAGE='${NEW_IMAGE}' bash -s" <<'REMOTE_EOF'
+          set -euo pipefail
+          cleanup_pass() {
+            rm -f /tmp/.ecr_pass
+          }
+          trap cleanup_pass EXIT
+
+          docker login --username AWS --password-stdin "$REGISTRY" < /tmp/.ecr_pass
+          rm -f /tmp/.ecr_pass
+
+          docker pull "$NEW_IMAGE"
+
+          PREV_EXISTS=0
+          if docker ps -a --format '{{.Names}}' | grep -qx 'api-libros'; then
+            PREV_EXISTS=1
+            docker rm -f api-libros-prev >/dev/null 2>&1 || true
+            docker stop api-libros >/dev/null 2>&1 || true
+            docker rename api-libros api-libros-prev
+          fi
+
+          docker run -d \
+            --name api-libros \
+            --restart unless-stopped \
+            --env-file /etc/api-libros/.env \
+            -p 127.0.0.1:3000:3000 \
+            "$NEW_IMAGE"
+
+          VERIFIED=0
+          for i in $(seq 1 15); do
+            HEALTH_CODE=$(curl -s -o /tmp/health.json -w '%{http_code}' http://127.0.0.1/health || echo 000)
+            LIBROS_CODE=$(curl -s -o /tmp/libros.json -w '%{http_code}' http://127.0.0.1/libros || echo 000)
+            if [ "$HEALTH_CODE" = "200" ] && [ "$LIBROS_CODE" = "200" ]; then
+              VERIFIED=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$VERIFIED" -ne 1 ]; then
+            echo "::error::La nueva versión falló la verificación de /health o /libros"
+            docker logs api-libros --tail 50 || true
+            docker rm -f api-libros >/dev/null 2>&1 || true
+            if [ "$PREV_EXISTS" -eq 1 ]; then
+              echo "Restaurando contenedor anterior..."
+              docker rename api-libros-prev api-libros
+              docker start api-libros
+            fi
+            exit 1
+          fi
+
+          docker rm -f api-libros-prev >/dev/null 2>&1 || true
+          echo "=== /health (200) ==="
+          cat /tmp/health.json
+          echo ""
+          echo "=== /libros (200) ==="
+          cat /tmp/libros.json
+          echo ""
+          rm -f /tmp/health.json /tmp/libros.json
+          docker image prune -f >/dev/null 2>&1 || true
+          REMOTE_EOF
+
+      - name: Verificar endpoints públicos desde el runner
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          set -euo pipefail
+          HEALTH_STATUS=$(curl -s -o /tmp/pub_health.json -w '%{http_code}' --max-time 10 "http://${EC2_HOST}/health")
+          LIBROS_STATUS=$(curl -s -o /tmp/pub_libros.json -w '%{http_code}' --max-time 10 "http://${EC2_HOST}/libros")
+          echo "GET /health -> HTTP ${HEALTH_STATUS}"
+          cat /tmp/pub_health.json
+          echo ""
+          echo "GET /libros -> HTTP ${LIBROS_STATUS}"
+          cat /tmp/pub_libros.json
+          echo ""
+          test "$HEALTH_STATUS" = "200"
+          test "$LIBROS_STATUS" = "200"
+
+      - name: Revocar IP temporal del runner del SG de EC2
+        if: always()
+        env:
+          EC2_SG_ID: ${{ secrets.EC2_SG_ID }}
+          RUNNER_IP: ${{ steps.sg.outputs.runner_ip }}
+        run: |
+          if [ -n "$RUNNER_IP" ]; then
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$EC2_SG_ID" \
+              --protocol tcp \
+              --port 22 \
+              --cidr "${RUNNER_IP}/32" || true
+          fi

@@ -1,0 +1,19 @@
+{
+  "name": "api-libros-aws-cicd",
+  "version": "1.0.0",
+  "description": "API REST para catálogo de libros en Node.js/Express con MySQL RDS, Docker y CI/CD en GitHub Actions",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --verbose"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mysql2": "^3.11.5"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  }
+}
